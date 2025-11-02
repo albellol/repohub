@@ -9,7 +9,7 @@
 ## Images
 Home tab (Work in progress):
 ![Home](https://i.imgur.com/DVLQR0X.png)
-Expore tab:
+Explore tab:
 ![Explore](https://i.imgur.com/BeXcqu1.png)
 Library:
 ![enter image description here](https://i.imgur.com/PIuIWFk.png)
