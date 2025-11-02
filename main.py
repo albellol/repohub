@@ -5,8 +5,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QFrame, QLineEdit, QStackedWidget, QSizePolicy, QLayout,
                            QDialog, QDialogButtonBox, QFileDialog, QMessageBox, QProgressDialog,
                            QListWidget, QListWidgetItem)
-from PyQt6.QtCore import Qt, QSize, QRect, QPoint, QTimer, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QRect, QPoint, QTimer, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QPixmap, QIcon, QPalette, QColor, QPainter, QPainterPath, QFontMetrics
+
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtSvgWidgets import QSvgWidget
 from fuzzywuzzy import fuzz
@@ -20,6 +21,29 @@ import shutil
 import zipfile
 import webbrowser
 import psutil
+import threading
+import heapq
+import re
+
+# Global requests session for connection pooling
+_requests_session = None
+
+def get_requests_session():
+    """Get or create a requests session with connection pooling and timeouts"""
+    global _requests_session
+    if _requests_session is None:
+        _requests_session = requests.Session()
+        # Set default timeouts
+        _requests_session.timeout = 10
+        # Enable connection pooling
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=10,
+            max_retries=2
+        )
+        _requests_session.mount('http://', adapter)
+        _requests_session.mount('https://', adapter)
+    return _requests_session
 
 def resource_path(relative_path):
     """Get absolute path to resource, works for dev and for PyInstaller"""
@@ -63,16 +87,43 @@ def launch_game(steam_app_id):
     except Exception as e:
         print(f"Failed to launch the game: {e}")
 
+# Cache for process checking
+_process_name_cache = None
+_process_cache_time = 0
+_PROCESS_CACHE_TTL = 2  # Cache for 2 seconds
+
 def is_game_running(process_name="repo.exe"):
+    global _process_name_cache, _process_cache_time
+    import time
+    current_time = time.time()
+    
+    # Use cached result if available and not expired
+    if _process_name_cache is not None and (current_time - _process_cache_time) < _PROCESS_CACHE_TTL:
+        return _process_name_cache
+    
+    process_name_lower = process_name.lower()
+    # Use early exit optimization with minimal info fetching
     for proc in psutil.process_iter(['name']):
-        if proc.info['name'] and proc.info['name'].lower() == process_name.lower():
-            return True
+        try:
+            proc_name = proc.info.get('name')
+            if proc_name and proc_name.lower() == process_name_lower:
+                _process_name_cache = True
+                _process_cache_time = current_time
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    
+    _process_name_cache = False
+    _process_cache_time = current_time
     return False
 
 class ConfigManager:
     def __init__(self):
         self.config_path = os.path.join(os.path.expanduser("~"), ".repohub", "config.json")
         self.config = self.load_config()
+        self._dirty = False
+        self._save_timer = None
+        self._lock = threading.Lock()
     
     def load_config(self):
         # Create config directory if it doesn't exist
@@ -87,44 +138,64 @@ class ConfigManager:
                 return {}
         return {}
     
-    def save_config(self):
-        with open(self.config_path, 'w') as f:
-            json.dump(self.config, f, indent=4)
+    def _do_save_config(self):
+        """Internal method to actually perform the save operation"""
+        with self._lock:
+            if self._dirty:
+                try:
+                    with open(self.config_path, 'w') as f:
+                        json.dump(self.config, f, indent=4)
+                    self._dirty = False
+                except Exception as e:
+                    print(f"Error saving config: {e}")
+    
+    def save_config(self, immediate=False):
+        """Save config file, with optional immediate save"""
+        with self._lock:
+            self._dirty = True
+        if immediate:
+            self._do_save_config()
+        else:
+            # Batch save: wait 500ms before saving to batch multiple operations
+            if self._save_timer is not None:
+                self._save_timer.cancel()
+            self._save_timer = threading.Timer(0.5, self._do_save_config)
+            self._save_timer.start()
     
     def get(self, key, default=None):
         return self.config.get(key, default)
     
-    def set(self, key, value):
+    def set(self, key, value, immediate=False):
         self.config[key] = value
-        self.save_config()
+        self.save_config(immediate=immediate)
     
     def get_installed_mods(self):
         return self.config.get('installed_mods', {})
     
-    def add_installed_mod(self, mod_name, mod_data):
+    def add_installed_mod(self, mod_name, mod_data, immediate=False):
         installed_mods = self.get_installed_mods()
         if not isinstance(installed_mods, dict):
             installed_mods = {}
         installed_mods[mod_name] = mod_data
         self.config['installed_mods'] = installed_mods
-        self.save_config()
+        self.save_config(immediate=immediate)
     
-    def remove_installed_mod(self, mod_name):
+    def remove_installed_mod(self, mod_name, immediate=False):
         installed_mods = self.get_installed_mods()
         if mod_name in installed_mods:
             del installed_mods[mod_name]
             self.config['installed_mods'] = installed_mods
-            self.save_config()
+            self.save_config(immediate=immediate)
     
     def get_installed_dependencies(self):
         return self.config.get('installed_dependencies', [])
     
-    def add_installed_dependency(self, dependency):
+    def add_installed_dependency(self, dependency, immediate=False):
         installed_deps = self.get_installed_dependencies()
         if dependency not in installed_deps:
             installed_deps.append(dependency)
             self.config['installed_dependencies'] = installed_deps
-            self.save_config()
+            self.save_config(immediate=immediate)
     
     def is_dependency_installed(self, dependency):
         return dependency in self.get_installed_dependencies()
@@ -175,19 +246,21 @@ class CardSection(QWidget):
     def setup_ui(self):
         layout = QHBoxLayout()
         layout.setSpacing(0)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(20, 0, 0, 0)  # Match section title padding-left
         
         # Create container for scroll area and buttons
         container = QWidget()
+        container.setContentsMargins(0, 0, 0, 0)
         container_layout = QHBoxLayout()
         container_layout.setSpacing(0)
         container_layout.setContentsMargins(0, 0, 0, 0)
         
         # Cards widget
         self.cards_widget = QWidget()
+        self.cards_widget.setContentsMargins(0, 0, 0, 0)
         self.cards_layout = QGridLayout()
         self.cards_layout.setSpacing(15)
-        self.cards_layout.setContentsMargins(20, 0, 20, 0)
+        self.cards_layout.setContentsMargins(0, 0, 20, 0)  # Removed left margin, added to CardSection main layout
         
         # Add placeholder cards
         for i in range(5):
@@ -208,10 +281,17 @@ class CardSection(QWidget):
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll_area.setFixedHeight(220)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll_area.setLineWidth(0)
         self.scroll_area.setStyleSheet("""
             QScrollArea {
                 border: none;
                 background-color: transparent;
+                padding: 0px;
+            }
+            QScrollArea > QWidget > QWidget {
+                padding: 0px;
+                margin: 0px;
             }
         """)
         
@@ -292,7 +372,7 @@ class CardSection(QWidget):
         """Update the minimum width of the cards widget based on the number of cards"""
         num_cards = self.cards_layout.count()
         if num_cards > 0:
-            min_width = (num_cards * 200) + ((num_cards - 1) * 15) + 40  # cards * 200px + spaces * 15px + 40px margins
+            min_width = (num_cards * 200) + ((num_cards - 1) * 15) + 20  # cards * 200px + spaces * 15px + 20px right margin
             self.cards_widget.setMinimumWidth(min_width)
     
     def scroll_left(self):
@@ -318,6 +398,9 @@ class ModalOverlay(QWidget):
                 background-color: #1a1a1a;
                 border-radius: 10px;
                 border: 1px solid #333;
+            }
+            QLabel {
+                border: none;
             }
         """)
         
@@ -359,11 +442,14 @@ class ModalOverlay(QWidget):
         main_layout.setContentsMargins(0, 0, 0, 0)
         
     def set_content(self, widget):
-        # Clear existing content
+        # Clear existing content (batch deletion for efficiency)
+        items_to_delete = []
         while self.content_layout.count():
             item = self.content_layout.takeAt(0)
             if item.widget():
-                item.widget().deleteLater()
+                items_to_delete.append(item.widget())
+        for w in items_to_delete:
+            w.deleteLater()
         
         # Add new content
         self.content_layout.addWidget(widget)
@@ -441,6 +527,14 @@ class ModDetailsContent(QWidget):
         self.temp_file = get_temp_file_path(f"icon_{hash(mod_data['icon'])}.png")
         self.config = ConfigManager()
         self.setup_ui(mod_data)
+    
+    def is_mod_disabled(self):
+        """Check if the mod is currently disabled (exists as zip file)"""
+        if not self.repo_path:
+            return False
+        disabled_mods_dir = os.path.join(self.repo_path, "BepInEx", "plugins", "disabled_mods")
+        zip_path = os.path.join(disabled_mods_dir, f"{self.mod_data['name']}.zip")
+        return os.path.exists(zip_path)
     
     def setup_ui(self, mod_data):
         # Main layout with two columns
@@ -559,8 +653,10 @@ class ModDetailsContent(QWidget):
         button_container.setSpacing(10)
         
         if self.is_library:
-            # Disable button
-            self.disable_button = QPushButton("Disable")
+            # Disable button - set text based on actual mod state
+            is_disabled = self.is_mod_disabled()
+            button_text = "Enable" if is_disabled else "Disable"
+            self.disable_button = QPushButton(button_text)
             self.disable_button.setCursor(Qt.CursorShape.PointingHandCursor)
             self.disable_button.setStyleSheet("""
                 QPushButton {
@@ -646,12 +742,15 @@ class ModDetailsContent(QWidget):
         
         # Mod icon
         icon_label = QLabel()
-        response = requests.get(mod_data["icon"])
+        response = get_requests_session().get(mod_data["icon"])
         if response.status_code == 200:
-            image = Image.open(io.BytesIO(response.content))
-            image = image.resize((300, 300), Image.Resampling.LANCZOS)
-            image.save(self.temp_file)
-            icon_label.setPixmap(QPixmap(self.temp_file))
+            try:
+                image = Image.open(io.BytesIO(response.content))
+                image = image.resize((300, 300), Image.Resampling.LANCZOS)
+                image.save(self.temp_file)
+                icon_label.setPixmap(QPixmap(self.temp_file))
+            except Exception as e:
+                print(f"Error processing icon: {e}")
         icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         right_column.addWidget(icon_label)
         
@@ -717,7 +816,7 @@ class ModDetailsContent(QWidget):
         try:
             # First, fetch all available mods
             url = "https://thunderstore.io/c/repo/api/v1/package/"
-            response = requests.get(url)
+            response = get_requests_session().get(url)
             if response.status_code != 200:
                 raise Exception("Failed to fetch mod list from Thunderstore")
             
@@ -792,7 +891,7 @@ class ModDetailsContent(QWidget):
                 # If no download URL in mod_data, try to get it from the API
                 mod_name = mod_data['name']
                 url = f"https://thunderstore.io/c/repo/api/v1/package/{mod_name}/"
-                response = requests.get(url)
+                response = get_requests_session().get(url)
                 if response.status_code == 200:
                     api_data = response.json()
                     # Get the latest version
@@ -824,7 +923,7 @@ class ModDetailsContent(QWidget):
             os.makedirs(target_dir, exist_ok=True)
 
             # Download the mod
-            response = requests.get(download_url, stream=True)
+            response = get_requests_session().get(download_url, stream=True)
             response.raise_for_status()
             
             # Get the total file size
@@ -832,26 +931,32 @@ class ModDetailsContent(QWidget):
             block_size = 1024
             downloaded = 0
             
-            # Create a temporary file
+            # Create a temporary file with proper cleanup
             temp_file = get_temp_file_path(f"{mod_data['name']}.zip")
-            with open(temp_file, 'wb') as f:
-                for data in response.iter_content(block_size):
-                    downloaded += len(data)
-                    f.write(data)
-                    progress.setValue(int((downloaded / total_size) * 100))
-                    QApplication.processEvents()
-            
-            # Extract the mod to the appropriate directory
-            with zipfile.ZipFile(temp_file, 'r') as zip_ref:
-                zip_ref.extractall(target_dir)
-            
-            # Clean up
-            os.remove(temp_file)
+            try:
+                with open(temp_file, 'wb') as f:
+                    for data in response.iter_content(block_size):
+                        downloaded += len(data)
+                        f.write(data)
+                        progress.setValue(int((downloaded / total_size) * 100))
+                        QApplication.processEvents()
+                
+                # Extract the mod to the appropriate directory
+                with zipfile.ZipFile(temp_file, 'r') as zip_ref:
+                    zip_ref.extractall(target_dir)
+            finally:
+                # Ensure cleanup even if extraction fails
+                if os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except Exception as e:
+                        print(f"Error removing temp file {temp_file}: {e}")
             
             # Save to installed mods (only for main mods, not dependencies)
             if not is_dependency:
                 config = ConfigManager()
-                config.add_installed_mod(mod_data['name'], mod_data)
+                # Use immediate=True to ensure config is saved before refreshing library tab
+                config.add_installed_mod(mod_data['name'], mod_data, immediate=True)
                 
                 # Update the library tab
                 main_window = self.window()
@@ -896,10 +1001,10 @@ class ModDetailsContent(QWidget):
     def closeEvent(self, event):
         # Clean up the temporary file when the widget is closed
         try:
-            if os.path.exists(self.temp_file):
+            if hasattr(self, 'temp_file') and os.path.exists(self.temp_file):
                 os.remove(self.temp_file)
-        except:
-            pass
+        except Exception as e:
+            print(f"Error cleaning up temp file: {e}")
         super().closeEvent(event)
 
     def format_file_size(self, size_bytes):
@@ -938,6 +1043,15 @@ class ModDetailsContent(QWidget):
                 # Update button text
                 self.disable_button.setText("Enable")
                 
+                # Refresh the library tab to move mod to disabled section
+                main_window = self.window()
+                if main_window:
+                    for i in range(main_window.stacked_widget.count()):
+                        widget = main_window.stacked_widget.widget(i)
+                        if isinstance(widget, LibraryTab):
+                            widget.load_installed_mods()
+                            break
+                
                 QMessageBox.information(
                     self,
                     "Success",
@@ -966,6 +1080,15 @@ class ModDetailsContent(QWidget):
                 
                 # Update button text
                 self.disable_button.setText("Disable")
+                
+                # Refresh the library tab to move mod to enabled section
+                main_window = self.window()
+                if main_window:
+                    for i in range(main_window.stacked_widget.count()):
+                        widget = main_window.stacked_widget.widget(i)
+                        if isinstance(widget, LibraryTab):
+                            widget.load_installed_mods()
+                            break
                 
                 QMessageBox.information(
                     self,
@@ -1006,7 +1129,8 @@ class ModDetailsContent(QWidget):
                 
                 # Remove from installed mods
                 config = ConfigManager()
-                config.remove_installed_mod(self.mod_data['name'])
+                # Use immediate=True to ensure config is saved before refreshing library tab
+                config.remove_installed_mod(self.mod_data['name'], immediate=True)
                 
                 # Update the library tab
                 main_window = self.window()
@@ -1054,14 +1178,27 @@ class ImageProcessor(QThread):
         self.temp_file = get_temp_file_path(f"icon_{hash(icon_url + label_key)}.png")
         
     def run(self):
+        temp_file_used = False
         try:
-            response = requests.get(self.icon_url)
+            response = get_requests_session().get(self.icon_url)
             if response.status_code == 200:
                 image = Image.open(io.BytesIO(response.content))
                 image = image.resize((200, 200), Image.Resampling.LANCZOS)
-                image.save(self.temp_file)
                 
-                pixmap = QPixmap(self.temp_file)
+                # Use temp file only for loading into QPixmap, then cleanup immediately
+                try:
+                    image.save(self.temp_file)
+                    temp_file_used = True
+                    pixmap = QPixmap(self.temp_file)
+                finally:
+                    # Clean up immediately after loading pixmap
+                    if temp_file_used and os.path.exists(self.temp_file):
+                        try:
+                            os.remove(self.temp_file)
+                            temp_file_used = False
+                        except Exception:
+                            pass  # Will cleanup in finally block below
+                
                 rounded = QPixmap(pixmap.size())
                 rounded.fill(Qt.GlobalColor.transparent)
                 
@@ -1076,17 +1213,18 @@ class ImageProcessor(QThread):
                 painter.end()
                 
                 self.imageProcessed.emit(self.icon_url, rounded, self.label_key)
-                
-                # Clean up the temporary file
-                try:
-                    if os.path.exists(self.temp_file):
-                        os.remove(self.temp_file)
-                except:
-                    pass
             else:
                 print(f"Failed to fetch image from {self.icon_url}: Status code {response.status_code}")
         except Exception as e:
             print(f"Error processing image from {self.icon_url}: {e}")
+        finally:
+            # Ensure cleanup of temp file in all cases
+            if temp_file_used or os.path.exists(self.temp_file):
+                try:
+                    if os.path.exists(self.temp_file):
+                        os.remove(self.temp_file)
+                except Exception:
+                    pass  # Best effort cleanup
 
 class ExploreTab(QWidget):
     def __init__(self):
@@ -1108,7 +1246,7 @@ class ExploreTab(QWidget):
     def load_all_mods(self):
         """Load all mods from the API and cache them"""
         url = "https://thunderstore.io/c/repo/api/v1/package/"
-        response = requests.get(url)
+        response = get_requests_session().get(url)
         
         if response.status_code == 200:
             data = response.json()
@@ -1116,25 +1254,29 @@ class ExploreTab(QWidget):
             
             for mod in data:
                 mod_name = mod["name"]
+                mod_name_lower = mod_name.lower()
                 
                 # Skip mods with "modpack" or "bepinex" in their name
-                if "modpack" in mod_name.lower() or "bepinex" in mod_name.lower():
+                if "modpack" in mod_name_lower or "bepinex" in mod_name_lower:
                     continue
                 
-                # Get the latest version
+                # Get the latest version (pre-compute once)
                 newest_version = max(mod["versions"], key=lambda version: version["version_number"])
+                description = newest_version["description"]
                 
-                # Store mod data
+                # Store mod data with pre-computed lowercase strings for search optimization
                 self.all_mods.append({
                     "name": mod_name,
-                    "creator": mod["owner"],  # Add creator's name
-                    "description": newest_version["description"],
+                    "name_lower": mod_name_lower,  # Pre-computed for search
+                    "creator": mod["owner"],
+                    "description": description,
+                    "description_lower": description.lower() if description else "",  # Pre-computed for search
                     "version": newest_version["version_number"],
                     "downloads": newest_version["downloads"],
                     "icon": newest_version["icon"],
-                    "file_size": newest_version.get("file_size", 0),  # Add file size
-                    "dependencies": newest_version.get("dependencies", []),  # Add dependencies
-                    "download_url": newest_version["download_url"]  # Add download URL
+                    "file_size": newest_version.get("file_size", 0),
+                    "dependencies": newest_version.get("dependencies", []),
+                    "download_url": newest_version["download_url"]
                 })
             
             # Sort all mods by downloads
@@ -1178,11 +1320,14 @@ class ExploreTab(QWidget):
         cards_widget = card_section.scroll_area.widget()
         cards_layout = cards_widget.layout()
         
-        # Clear existing cards
+        # Clear existing cards (batch deletion for efficiency)
+        items_to_delete = []
         while cards_layout.count():
             item = cards_layout.takeAt(0)
             if item.widget():
-                item.widget().deleteLater()
+                items_to_delete.append(item.widget())
+        for w in items_to_delete:
+            w.deleteLater()
         
         # Add new cards for each mod
         for i, mod in enumerate(mods):
@@ -1284,7 +1429,7 @@ class ExploreTab(QWidget):
             processor.start()
         
         # Update the minimum width of the cards widget
-        min_width = (len(mods) * 200) + ((len(mods) - 1) * 15) + 40  # cards * 200px + spaces * 15px + 40px margins
+        min_width = (len(mods) * 200) + ((len(mods) - 1) * 15) + 20  # cards * 200px + spaces * 15px + 20px right margin
         cards_widget.setMinimumWidth(min_width)
 
     def setup_ui(self):
@@ -1394,7 +1539,7 @@ class ExploreTab(QWidget):
                 cards_layout.addWidget(card, 0, i)
             
             # Update minimum width
-            min_width = (num_cards * 200) + ((num_cards - 1) * 15) + 40
+            min_width = (num_cards * 200) + ((num_cards - 1) * 15) + 20  # cards * 200px + spaces * 15px + 20px right margin
             cards_widget.setMinimumWidth(min_width)
             
             self.content_layout.addWidget(card_section)
@@ -1469,33 +1614,63 @@ class ExploreTab(QWidget):
         if len(query) < 3:
             return
             
-        # Clear existing search results and active labels
+        # Clear existing search results and active labels (batch deletion for efficiency)
         self.active_labels.clear()
+        items_to_delete = []
         while self.search_results_layout.count():
             item = self.search_results_layout.takeAt(0)
             if item.widget():
-                item.widget().deleteLater()
+                items_to_delete.append(item.widget())
+        for w in items_to_delete:
+            w.deleteLater()
         
         # Split query into words for more precise matching
-        query_words = query.lower().split()
+        query_lower = query.lower()
+        query_words = query_lower.split()
+        num_query_words = len(query_words)
         
-        # Get matching mods with scores
-        matches = []
+        # Use a heap to efficiently track top 20 matches without full sort
+        matches_heap = []  # Min-heap of (negative_score, mod) pairs for top-N
+        heap_max_size = 20
+        
+        # Get matching mods with scores using pre-computed lowercase strings
         for mod in self.all_mods:
-            mod_name = mod["name"].lower()
-            mod_desc = mod["description"].lower()
+            # Use pre-computed lowercase strings
+            mod_name_lower = mod.get("name_lower", mod["name"].lower())
+            mod_desc_lower = mod.get("description_lower", mod.get("description", "").lower())
             
-            # Calculate various match scores
-            name_exact_score = 100 if any(word in mod_name for word in query_words) else 0
-            name_fuzzy_score = max(fuzz.partial_ratio(word, mod_name) for word in query_words)
-            name_token_score = fuzz.token_sort_ratio(query, mod_name)
+            # Early exit: skip if no basic match
+            has_name_match = any(word in mod_name_lower for word in query_words)
+            has_desc_match = any(word in mod_desc_lower for word in query_words)
             
-            desc_exact_score = 100 if any(word in mod_desc for word in query_words) else 0
-            desc_fuzzy_score = max(fuzz.partial_ratio(word, mod_desc) for word in query_words)
-            desc_token_score = fuzz.token_sort_ratio(query, mod_desc)
+            if not has_name_match and not has_desc_match:
+                # Quick fuzzy check on name only before skipping
+                if fuzz.partial_ratio(query_lower, mod_name_lower) < 30:
+                    continue
             
-            desc_word_matches = sum(1 for word in query_words if word in mod_desc)
-            desc_word_score = (desc_word_matches / len(query_words)) * 100
+            # Calculate various match scores (optimize expensive operations)
+            name_exact_score = 100 if has_name_match else 0
+            
+            # Only do expensive fuzzy operations if we have a chance
+            name_fuzzy_score = 0
+            name_token_score = 0
+            if name_exact_score == 0:  # Only if no exact match
+                name_fuzzy_score = max(fuzz.partial_ratio(word, mod_name_lower) for word in query_words)
+                if name_fuzzy_score > 50:  # Early exit for low scores
+                    name_token_score = fuzz.token_sort_ratio(query_lower, mod_name_lower)
+            
+            desc_exact_score = 100 if has_desc_match else 0
+            
+            # Only do expensive desc fuzzy if needed
+            desc_fuzzy_score = 0
+            desc_token_score = 0
+            if desc_exact_score == 0 and mod_desc_lower:
+                desc_fuzzy_score = max(fuzz.partial_ratio(word, mod_desc_lower) for word in query_words)
+                if desc_fuzzy_score > 50:
+                    desc_token_score = fuzz.token_sort_ratio(query_lower, mod_desc_lower)
+            
+            desc_word_matches = sum(1 for word in query_words if word in mod_desc_lower) if mod_desc_lower else 0
+            desc_word_score = (desc_word_matches / num_query_words) * 100 if num_query_words > 0 else 0
             
             total_score = (
                 (name_exact_score * 0.35) +
@@ -1507,19 +1682,28 @@ class ExploreTab(QWidget):
                 (desc_word_score * 0.05)
             )
             
-            if mod_name.startswith(query.lower()):
+            # Boost scores for prefix matches
+            if mod_name_lower.startswith(query_lower):
                 total_score *= 1.5
             
-            if all(word in mod_desc for word in query_words):
+            if num_query_words > 0 and all(word in mod_desc_lower for word in query_words):
                 total_score *= 1.3
             
+            # Only add if score is above threshold
             if total_score > 35:
-                matches.append((mod, total_score))
+                # Use min-heap with negative scores to efficiently track top-N items
+                # Add mod name as tiebreaker to avoid dict comparison errors
+                heap_item = (-total_score, mod["name"], mod)
+                if len(matches_heap) < heap_max_size:
+                    heapq.heappush(matches_heap, heap_item)
+                elif -matches_heap[0][0] < total_score:
+                    heapq.heapreplace(matches_heap, heap_item)
         
-        matches.sort(key=lambda x: x[1], reverse=True)
-        matches = matches[:20]
+        # Extract top matches in descending order (negate scores back)
+        matches = [(-score, mod) for score, name, mod in matches_heap]
+        matches.sort(key=lambda x: x[0], reverse=True)
         
-        for mod, score in matches:
+        for score, mod in matches:
             card = QFrame()
             card.setFixedSize(200, 200)
             card.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1663,8 +1847,10 @@ class HomeTab(QWidget):
         self.active_processors = []  # Track active processors
         self.config = ConfigManager()
         self.repo_path = self.config.get('repo_path')  # Get repo path from config
+        self.repo_moments_section = None  # Reference to R.E.P.O. moments CardSection
         self.setup_ui()
         self.load_new_mods()  # Load new mods on initialization
+        self.load_repo_moments()  # Load Medal.tv clips
     
     def setup_ui(self):
         layout = QVBoxLayout()
@@ -1691,6 +1877,9 @@ class HomeTab(QWidget):
             
             # For R.E.P.O. moments, add a second row with 16:9 cards
             if section == "R.E.P.O. moments":
+                # Store reference to this section for later use
+                self.repo_moments_section = card_section
+                
                 # Get the cards widget and its layout
                 cards_widget = card_section.scroll_area.widget()
                 cards_layout = cards_widget.layout()
@@ -1711,7 +1900,7 @@ class HomeTab(QWidget):
                     cards_layout.addWidget(card, 1, i)  # Add to second row (row index 1)
                 
                 # Update minimum width to account for both rows
-                min_width = (5 * card_width) + (4 * 15) + 40  # 5 cards * card_width + 4 spaces * 15px + 40px margins
+                min_width = (5 * card_width) + (4 * 15) + 20  # 5 cards * card_width + 4 spaces * 15px + 20px right margin
                 cards_widget.setMinimumWidth(min_width)
                 
                 # Update scroll area height to show both rows
@@ -1754,7 +1943,7 @@ class HomeTab(QWidget):
         try:
             # Fetch all mods from the API
             url = "https://thunderstore.io/c/repo/api/v1/package/"
-            response = requests.get(url)
+            response = get_requests_session().get(url)
             
             if response.status_code == 200:
                 data = response.json()
@@ -1903,7 +2092,7 @@ class HomeTab(QWidget):
                         processor.start()
                         
                     # Update the minimum width of the cards widget to ensure proper spacing
-                    min_width = (10 * 200) + (9 * 15) + 40  # 10 cards * 200px + 9 spaces * 15px + 40px margins
+                    min_width = (10 * 200) + (9 * 15) + 20  # 10 cards * 200px + 9 spaces * 15px + 20px right margin
                     cards_widget.setMinimumWidth(min_width)
         except Exception as e:
             print(f"Error loading new mods: {str(e)}")
@@ -1929,6 +2118,306 @@ class HomeTab(QWidget):
         """Clean up processors when the widget is closed"""
         self.cleanup_processors()
         super().closeEvent(event)
+    
+    def load_repo_moments(self):
+        """Load Medal.tv clips for R.E.P.O. moments section"""
+        if not self.repo_moments_section:
+            print("R.E.P.O. moments section not found, skipping clip loading")
+            return
+        
+        try:
+            # Medal.tv API endpoint
+            medal_api_key = "pub_AefKsHpmIpNg6zm5uswbazpPtK6uh2Tq"
+            url = "https://developers.medal.tv/v1/search"
+            
+            # Search for R.E.P.O. related clips (try multiple search terms for better results)
+            params = {
+                "text": "repo",
+                "limit": 10
+            }
+            
+            headers = {
+                "Authorization": medal_api_key,
+                "Content-Type": "application/json"
+            }
+            
+            response = get_requests_session().get(url, params=params, headers=headers)
+            response.raise_for_status()  # Raise exception for bad status codes
+            
+            data = response.json()
+            clips = data.get("contentObjects", [])
+            
+            if not clips:
+                print("No clips found for R.E.P.O. moments")
+                # Try alternative search if first search fails
+                params["text"] = "r.e.p.o"
+                response = get_requests_session().get(url, params=params, headers=headers)
+                if response.status_code == 200:
+                    data = response.json()
+                    clips = data.get("contentObjects", [])
+            
+            # Populate cards with clips (even if empty list, will show placeholders)
+            self.populate_repo_moments_cards(clips)
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Network error loading Medal.tv clips: {e}")
+            # Keep placeholder cards on network failure
+        except KeyError as e:
+            print(f"Unexpected API response format: {e}")
+            # Keep placeholder cards on parsing error
+        except Exception as e:
+            print(f"Error loading Medal.tv clips: {e}")
+            import traceback
+            traceback.print_exc()
+            # Keep placeholder cards on error
+    
+    def populate_repo_moments_cards(self, clips):
+        """Populate the R.E.P.O. moments section with Medal.tv clip cards"""
+        if not self.repo_moments_section:
+            return
+        
+        try:
+            cards_widget = self.repo_moments_section.scroll_area.widget()
+            cards_layout = cards_widget.layout()
+            
+            if not cards_layout:
+                print("No cards layout found in R.E.P.O. moments section")
+                return
+            
+            # Ensure layout margins are correct (0 left, 20 right)
+            cards_layout.setContentsMargins(0, 0, 20, 0)
+            
+            # Calculate 16:9 width based on 200px height
+            card_width = int(200 * (16/9))
+            
+            # Clear existing placeholder cards (batch deletion for efficiency)
+            items_to_delete = []
+            for row in range(2):
+                for col in range(5):
+                    item = cards_layout.itemAtPosition(row, col)
+                    if item and item.widget():
+                        items_to_delete.append(item.widget())
+            
+            for w in items_to_delete:
+                cards_layout.removeWidget(w)
+                if w:
+                    w.deleteLater()
+            
+            # Ensure we have clips data
+            if not clips:
+                clips = []
+            
+            # Create clip cards for up to 10 clips (5 per row × 2 rows)
+            for idx, clip in enumerate(clips[:10]):
+                try:
+                    row = idx // 5
+                    col = idx % 5
+                    
+                    # Validate clip data has required fields
+                    if not isinstance(clip, dict):
+                        continue
+                    
+                    # Create clip card
+                    card = self.create_clip_card(clip, card_width, 200)
+                    if card:
+                        cards_layout.addWidget(card, row, col)
+                except Exception as e:
+                    print(f"Error creating clip card {idx}: {e}")
+                    continue
+            
+            # Fill remaining slots with placeholder cards if needed
+            total_cards = len(clips[:10])
+            for idx in range(total_cards, 10):
+                try:
+                    row = idx // 5
+                    col = idx % 5
+                    
+                    placeholder = QWidget()
+                    placeholder.setFixedSize(card_width, 200)
+                    placeholder.setStyleSheet("background-color: #333; border-radius: 10px;")
+                    cards_layout.addWidget(placeholder, row, col)
+                except Exception as e:
+                    print(f"Error creating placeholder card {idx}: {e}")
+                    continue
+            
+            # Update layout
+            cards_widget.updateGeometry()
+            cards_layout.update()
+            cards_widget.update()
+            
+        except Exception as e:
+            print(f"Error populating R.E.P.O. moments cards: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def extract_video_url(self, clip_data):
+        """Extract video embed URL from Medal.tv API response"""
+        # Try embedIframeUrl first (direct embed URL)
+        embed_url = clip_data.get("embedIframeUrl", "")
+        if embed_url:
+            # Check if it's an iframe HTML tag
+            if embed_url.startswith("<iframe"):
+                # Extract URL from iframe src attribute
+                match = re.search(r'src=[\'"]([^\'"]+)[\'"]', embed_url)
+                if match:
+                    return match.group(1)
+            # If it's already a URL, return it
+            elif embed_url.startswith("http"):
+                return embed_url
+        
+        # Try embedIframeCode
+        embed_code = clip_data.get("embedIframeCode", "")
+        if embed_code:
+            match = re.search(r'src=[\'"]([^\'"]+)[\'"]', embed_code)
+            if match:
+                return match.group(1)
+        
+        # Try directClipUrl as fallback
+        direct_url = clip_data.get("directClipUrl", "")
+        if direct_url:
+            return direct_url
+        
+        return None
+    
+    def create_clip_card(self, clip_data, width, height):
+        """Create a card widget for a Medal.tv clip with play button overlay"""
+        card = QFrame()
+        card.setFixedSize(width, height)
+        card.setStyleSheet("""
+            QFrame {
+                background-color: transparent;
+                border-radius: 10px;
+            }
+        """)
+        
+        # Main layout for card
+        main_layout = QVBoxLayout(card)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        # Container for hover effect
+        container = HoverFrame()
+        container.setFixedSize(width, height)
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+        
+        # Extract video URL
+        video_url = self.extract_video_url(clip_data)
+        
+        # Create background thumbnail area (leaving space for title at bottom)
+        thumbnail_height = height - 40  # Reserve 40px for title
+        thumbnail_frame = QFrame()
+        thumbnail_frame.setFixedSize(width, thumbnail_height)
+        thumbnail_frame.setStyleSheet("""
+            QFrame {
+                background-color: #222;
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
+            }
+        """)
+        thumbnail_layout = QVBoxLayout(thumbnail_frame)
+        thumbnail_layout.setContentsMargins(0, 0, 0, 0)
+        thumbnail_layout.setSpacing(0)
+        
+        # Add semi-transparent overlay for better play button visibility
+        overlay = QFrame()
+        overlay.setStyleSheet("""
+            QFrame {
+                background-color: rgba(0, 0, 0, 0.3);
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
+            }
+        """)
+        overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        overlay_layout = QVBoxLayout(overlay)
+        overlay_layout.setContentsMargins(0, 0, 0, 0)
+        overlay_layout.setSpacing(0)
+        
+        # Play button (centered)
+        play_button = QLabel()
+        play_button.setText("▶")
+        play_button.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        play_button.setStyleSheet("""
+            QLabel {
+                background-color: transparent;
+                color: white;
+                font-size: 72px;
+                font-weight: bold;
+                border: none;
+            }
+        """)
+        play_button.setFixedSize(width, thumbnail_height)
+        play_button.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        
+        overlay_layout.addWidget(play_button)
+        thumbnail_layout.addWidget(overlay)
+        
+        container_layout.addWidget(thumbnail_frame)
+        
+        # Title overlay at bottom
+        title_overlay = QFrame()
+        title_overlay.setStyleSheet("""
+            QFrame {
+                background-color: rgba(0, 0, 0, 0.7);
+                border-bottom-left-radius: 10px;
+                border-bottom-right-radius: 10px;
+            }
+        """)
+        title_overlay.setFixedHeight(40)
+        title_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        
+        title_layout = QHBoxLayout(title_overlay)
+        title_layout.setContentsMargins(10, 0, 10, 0)
+        
+        title_label = QLabel()
+        title_text = clip_data.get("contentTitle", "R.E.P.O. Clip")
+        # Elide text if too long
+        metrics = QFontMetrics(title_label.font())
+        char_width = metrics.averageCharWidth()
+        elided_text = metrics.elidedText(title_text, Qt.TextElideMode.ElideRight, char_width * 30)
+        title_label.setText(elided_text)
+        title_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                font-size: 12px;
+                font-weight: 500;
+                background-color: transparent;
+                border: none;
+            }
+        """)
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_label.setToolTip(title_text)
+        title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        title_layout.addWidget(title_label)
+        
+        container_layout.addWidget(title_overlay)
+        
+        # Make card clickable to open video in browser
+        if video_url:
+            def handle_card_click(event):
+                # Only open on left button click
+                if event.button() == Qt.MouseButton.LeftButton:
+                    try:
+                        webbrowser.open(video_url)
+                    except Exception as e:
+                        print(f"Error opening clip URL: {e}")
+                event.accept()  # Stop event propagation
+            
+            # Set click handler on the card and container to ensure clicks work
+            card.mousePressEvent = handle_card_click
+            container.mousePressEvent = handle_card_click
+            thumbnail_frame.mousePressEvent = handle_card_click
+            card.setCursor(Qt.CursorShape.PointingHandCursor)
+            container.setCursor(Qt.CursorShape.PointingHandCursor)
+            thumbnail_frame.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            card.setCursor(Qt.CursorShape.ArrowCursor)
+            container.setCursor(Qt.CursorShape.ArrowCursor)
+        
+        main_layout.addWidget(container)
+        
+        return card
     
     def show_mod_details(self, mod_data):
         # Create overlay
@@ -2089,18 +2578,6 @@ class LibraryTab(QWidget):
         self.bepinex_frame.mousePressEvent = self.download_bepinex
         layout.addWidget(self.bepinex_frame)
         
-        # "My mods" header
-        header_label = QLabel("My mods")
-        header_label.setStyleSheet("""
-            QLabel {
-                color: white;
-                font-size: 24px;
-                font-weight: bold;
-                padding-left: 20px;
-            }
-        """)
-        layout.addWidget(header_label)
-        
         # Create a scroll area for the mod cards
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -2112,15 +2589,56 @@ class LibraryTab(QWidget):
             }
         """)
         
-        # Create a widget to hold the mod cards
-        self.mod_cards_widget = QWidget()
-        self.mod_cards_layout = FlowLayout(self.mod_cards_widget, margin=20, spacing=15)
-        self.mod_cards_widget.setLayout(self.mod_cards_layout)
+        # Create a container widget to hold all sections
+        scroll_content = QWidget()
+        scroll_content_layout = QVBoxLayout(scroll_content)
+        scroll_content_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_content_layout.setSpacing(20)
         
-        # Set a minimum size for the mod cards widget
-        self.mod_cards_widget.setMinimumSize(800, 400)
+        # "My mods" section header
+        self.enabled_header_label = QLabel("My mods")
+        self.enabled_header_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                font-size: 24px;
+                font-weight: bold;
+                padding-left: 20px;
+            }
+        """)
+        scroll_content_layout.addWidget(self.enabled_header_label)
         
-        scroll.setWidget(self.mod_cards_widget)
+        # Create a widget to hold the enabled mod cards
+        self.enabled_mod_cards_widget = QWidget()
+        self.enabled_mod_cards_layout = FlowLayout(self.enabled_mod_cards_widget, margin=20, spacing=15)
+        self.enabled_mod_cards_widget.setLayout(self.enabled_mod_cards_layout)
+        self.enabled_mod_cards_widget.setMinimumSize(800, 400)
+        scroll_content_layout.addWidget(self.enabled_mod_cards_widget)
+        
+        # "Disabled Mods" section header (hidden by default)
+        self.disabled_header_label = QLabel("Disabled Mods")
+        self.disabled_header_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                font-size: 24px;
+                font-weight: bold;
+                padding-left: 20px;
+            }
+        """)
+        self.disabled_header_label.hide()
+        scroll_content_layout.addWidget(self.disabled_header_label)
+        
+        # Create a widget to hold the disabled mod cards
+        self.disabled_mod_cards_widget = QWidget()
+        self.disabled_mod_cards_layout = FlowLayout(self.disabled_mod_cards_widget, margin=20, spacing=15)
+        self.disabled_mod_cards_widget.setLayout(self.disabled_mod_cards_layout)
+        self.disabled_mod_cards_widget.setMinimumSize(800, 400)
+        self.disabled_mod_cards_widget.hide()
+        scroll_content_layout.addWidget(self.disabled_mod_cards_widget)
+        
+        # Add stretch to push content to top
+        scroll_content_layout.addStretch()
+        
+        scroll.setWidget(scroll_content)
         layout.addWidget(scroll)
         
     def update_message_frame_style(self):
@@ -2204,7 +2722,7 @@ class LibraryTab(QWidget):
         try:
             # Download BepInEx directly from repomods.net
             url = "https://repomods.net/download/47"
-            response = requests.get(url, stream=True)
+            response = get_requests_session().get(url, stream=True)
             response.raise_for_status()
             
             # Get the total file size
@@ -2212,21 +2730,26 @@ class LibraryTab(QWidget):
             block_size = 1024
             downloaded = 0
             
-            # Create a temporary file
+            # Create a temporary file with proper cleanup
             temp_file = get_temp_file_path("bepinex.zip")
-            with open(temp_file, 'wb') as f:
-                for data in response.iter_content(block_size):
-                    downloaded += len(data)
-                    f.write(data)
-                    progress.setValue(int((downloaded / total_size) * 100))
-                    QApplication.processEvents()
-            
-            # Extract to the game directory
-            with zipfile.ZipFile(temp_file, 'r') as zip_ref:
-                zip_ref.extractall(self.repo_path)
-            
-            # Clean up
-            os.remove(temp_file)
+            try:
+                with open(temp_file, 'wb') as f:
+                    for data in response.iter_content(block_size):
+                        downloaded += len(data)
+                        f.write(data)
+                        progress.setValue(int((downloaded / total_size) * 100))
+                        QApplication.processEvents()
+                
+                # Extract to the game directory
+                with zipfile.ZipFile(temp_file, 'r') as zip_ref:
+                    zip_ref.extractall(self.repo_path)
+            finally:
+                # Ensure cleanup even if extraction fails
+                if os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except Exception as e:
+                        print(f"Error removing temp file {temp_file}: {e}")
             
             # Update UI
             self.update_bepinex_frame_style()
@@ -2281,14 +2804,34 @@ class LibraryTab(QWidget):
             error_dialog.exec()
             return False
             
+    def is_mod_disabled(self, mod_name):
+        """Check if a mod is currently disabled (exists as zip file)"""
+        if not self.repo_path:
+            return False
+        disabled_mods_dir = os.path.join(self.repo_path, "BepInEx", "plugins", "disabled_mods")
+        zip_path = os.path.join(disabled_mods_dir, f"{mod_name}.zip")
+        return os.path.exists(zip_path)
+    
     def load_installed_mods(self):
         print("Starting to load installed mods...")  # Debug print
         
-        # Clear existing mod cards
-        while self.mod_cards_layout.count():
-            item = self.mod_cards_layout.takeAt(0)
+        # Clear existing enabled mod cards (batch deletion for efficiency)
+        items_to_delete = []
+        while self.enabled_mod_cards_layout.count():
+            item = self.enabled_mod_cards_layout.takeAt(0)
             if item.widget():
-                item.widget().deleteLater()
+                items_to_delete.append(item.widget())
+        for w in items_to_delete:
+            w.deleteLater()
+        
+        # Clear existing disabled mod cards (batch deletion for efficiency)
+        items_to_delete = []
+        while self.disabled_mod_cards_layout.count():
+            item = self.disabled_mod_cards_layout.takeAt(0)
+            if item.widget():
+                items_to_delete.append(item.widget())
+        for w in items_to_delete:
+            w.deleteLater()
         
         # Load and add all installed mods
         config = ConfigManager()
@@ -2296,19 +2839,47 @@ class LibraryTab(QWidget):
         
         print(f"Found {len(installed_mods)} mods in config")  # Debug print
         
-        # Add each mod card to the layout
+        # Separate mods into enabled and disabled lists
+        enabled_mods = []
+        disabled_mods = []
+        
         for mod_name, mod_data in installed_mods.items():
-            print(f"Processing mod: {mod_name}")  # Debug print
-            self.add_mod_card(mod_name, mod_data)
+            if self.is_mod_disabled(mod_name):
+                disabled_mods.append((mod_name, mod_data))
+            else:
+                enabled_mods.append((mod_name, mod_data))
+        
+        # Add enabled mods to the enabled section
+        for mod_name, mod_data in enabled_mods:
+            print(f"Processing enabled mod: {mod_name}")  # Debug print
+            self.add_mod_card(mod_name, mod_data, self.enabled_mod_cards_layout)
+        
+        # Add disabled mods to the disabled section
+        for mod_name, mod_data in disabled_mods:
+            print(f"Processing disabled mod: {mod_name}")  # Debug print
+            self.add_mod_card(mod_name, mod_data, self.disabled_mod_cards_layout)
+        
+        # Show/hide disabled section based on whether there are disabled mods
+        if disabled_mods:
+            self.disabled_header_label.show()
+            self.disabled_mod_cards_widget.show()
+        else:
+            self.disabled_header_label.hide()
+            self.disabled_mod_cards_widget.hide()
         
         # Force layout update
-        self.mod_cards_widget.updateGeometry()
-        self.mod_cards_layout.update()
+        self.enabled_mod_cards_widget.updateGeometry()
+        self.enabled_mod_cards_layout.update()
+        self.disabled_mod_cards_widget.updateGeometry()
+        self.disabled_mod_cards_layout.update()
         self.update()
         
         print("Finished loading mods")  # Debug print
     
-    def add_mod_card(self, mod_name, mod_data):
+    def add_mod_card(self, mod_name, mod_data, target_layout=None):
+        """Add a mod card to the specified layout"""
+        if target_layout is None:
+            target_layout = self.enabled_mod_cards_layout
         print(f"Creating card for mod: {mod_name}")  # Debug print
         
         # Create a card widget
@@ -2345,7 +2916,7 @@ class LibraryTab(QWidget):
         try:
             # If icon is a URL, download it
             if isinstance(mod_data['icon'], str) and mod_data['icon'].startswith('http'):
-                response = requests.get(mod_data['icon'])
+                response = get_requests_session().get(mod_data['icon'])
                 if response.status_code == 200:
                     # Process image using PIL
                     image = Image.open(io.BytesIO(response.content))
@@ -2426,8 +2997,8 @@ class LibraryTab(QWidget):
         main_layout.addWidget(image_container)
         main_layout.addWidget(name_overlay)
         
-        # Add the card to the layout
-        self.mod_cards_layout.addWidget(card)
+        # Add the card to the specified layout
+        target_layout.addWidget(card)
         print(f"Successfully added card for {mod_name}")  # Debug print
     
     def show_mod_details(self, mod_data):
@@ -2457,15 +3028,21 @@ class LibraryTab(QWidget):
         
         if reply == QMessageBox.StandardButton.Yes:
             config = ConfigManager()
-            config.remove_installed_mod(mod_name)
-            self.mod_cards_layout.removeWidget(card)
+            # Use immediate=True since we're immediately removing the widget
+            config.remove_installed_mod(mod_name, immediate=True)
+            # Remove from whichever layout it's in
+            if self.enabled_mod_cards_layout.indexOf(card) >= 0:
+                self.enabled_mod_cards_layout.removeWidget(card)
+            elif self.disabled_mod_cards_layout.indexOf(card) >= 0:
+                self.disabled_mod_cards_layout.removeWidget(card)
             card.deleteLater()
 
 class RepoHub(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("R.E.P.O. HUB")
+        self.setWindowTitle("R.E.P.O. HUB v1.2.0")
         self.setMinimumSize(1200, 800)
+        self.drag_position = None  # Initialize drag_position for window dragging
         
         # Set window icon
         self.setWindowIcon(QIcon(resource_path("static/img/repo-hub-logo.ico")))
@@ -2573,7 +3150,7 @@ class RepoHub(QMainWindow):
         title_layout.setSpacing(0)
 
         # Title label
-        title_label = QLabel("R.E.P.O. HUB")
+        title_label = QLabel("R.E.P.O. HUB v1.2.0")
         title_label.setObjectName("titleLabel")
         title_layout.addWidget(title_label)
 
@@ -2737,11 +3314,15 @@ class RepoHub(QMainWindow):
         if event.button() == Qt.MouseButton.LeftButton:
             self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
+        else:
+            super().mousePressEvent(event)
             
     def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.MouseButton.LeftButton:
+        if event.buttons() == Qt.MouseButton.LeftButton and self.drag_position is not None:
             self.move(event.globalPosition().toPoint() - self.drag_position)
             event.accept()
+        else:
+            super().mouseMoveEvent(event)
     
     def handle_navigation(self, index, clicked_button):
         # Update button styles
