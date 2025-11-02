@@ -4,9 +4,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QPushButton, QLabel, QScrollArea, QGridLayout,
                            QFrame, QLineEdit, QStackedWidget, QSizePolicy, QLayout,
                            QDialog, QDialogButtonBox, QFileDialog, QMessageBox, QProgressDialog,
-                           QListWidget, QListWidgetItem)
+                           QListWidget, QListWidgetItem, QInputDialog)
 from PyQt6.QtCore import Qt, QSize, QRect, QPoint, QTimer, QThread, pyqtSignal, QObject
-from PyQt6.QtGui import QPixmap, QIcon, QPalette, QColor, QPainter, QPainterPath, QFontMetrics
+from PyQt6.QtGui import QPixmap, QIcon, QPalette, QColor, QPainter, QPainterPath, QFontMetrics, QClipboard
 
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtSvgWidgets import QSvgWidget
@@ -15,6 +15,7 @@ from fuzzywuzzy import process
 from PIL import Image, ImageDraw
 import io
 import json
+import base64
 import tempfile
 import atexit
 import shutil
@@ -590,7 +591,8 @@ class ModDetailsContent(QWidget):
         left_column.addWidget(name_label)
         
         # Creator name
-        creator_label = QLabel(f"by {mod_data['creator']}")
+        creator = mod_data.get('creator', mod_data.get('owner', 'Unknown'))
+        creator_label = QLabel(f"by {creator}")
         creator_label.setStyleSheet("""
             QLabel {
                 color: #aaa;
@@ -808,7 +810,7 @@ class ModDetailsContent(QWidget):
         # Install the main mod
         self.install_mod(self.mod_data)
     
-    def install_dependencies(self, dependencies):
+    def install_dependencies(self, dependencies, show_success_message=True):
         progress = QProgressDialog("Installing dependencies...", "Cancel", 0, len(dependencies), self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setWindowTitle("Installing Dependencies")
@@ -858,7 +860,7 @@ class ModDetailsContent(QWidget):
                                 "version": dep_version_data["version_number"],
                                 "download_url": dep_version_data["download_url"],
                                 "icon": dep_version_data["icon"]
-                            })
+                            }, show_success_message=show_success_message)
                             # Mark dependency as installed
                             self.config.add_installed_dependency(dep)
                             progress.setValue(i + 1)
@@ -879,7 +881,7 @@ class ModDetailsContent(QWidget):
         finally:
             progress.close()
     
-    def install_mod(self, mod_data):
+    def install_mod(self, mod_data, show_success_message=True):
         progress = QProgressDialog(f"Installing {mod_data['name']}...", "Cancel", 0, 100, self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setWindowTitle("Installing Mod")
@@ -967,12 +969,13 @@ class ModDetailsContent(QWidget):
                             widget.load_installed_mods()  # Reload all mods
                             break
             
-            QMessageBox.information(
-                self,
-                "Success",
-                f"{mod_data['name']} has been successfully installed!",
-                QMessageBox.StandardButton.Ok
-            )
+            if show_success_message:
+                QMessageBox.information(
+                    self,
+                    "Success",
+                    f"{mod_data['name']} has been successfully installed!",
+                    QMessageBox.StandardButton.Ok
+                )
             
         except requests.exceptions.RequestException as e:
             QMessageBox.critical(
@@ -1634,7 +1637,7 @@ class ExploreTab(QWidget):
         heap_max_size = 20
         
         # Get matching mods with scores using pre-computed lowercase strings
-        for mod in self.all_mods:
+        for idx, mod in enumerate(self.all_mods):
             # Use pre-computed lowercase strings
             mod_name_lower = mod.get("name_lower", mod["name"].lower())
             mod_desc_lower = mod.get("description_lower", mod.get("description", "").lower())
@@ -1692,15 +1695,15 @@ class ExploreTab(QWidget):
             # Only add if score is above threshold
             if total_score > 35:
                 # Use min-heap with negative scores to efficiently track top-N items
-                # Add mod name as tiebreaker to avoid dict comparison errors
-                heap_item = (-total_score, mod["name"], mod)
+                # Add mod name and index as tiebreakers to avoid dict comparison errors
+                heap_item = (-total_score, mod["name"], idx, mod)
                 if len(matches_heap) < heap_max_size:
                     heapq.heappush(matches_heap, heap_item)
                 elif -matches_heap[0][0] < total_score:
                     heapq.heapreplace(matches_heap, heap_item)
         
         # Extract top matches in descending order (negate scores back)
-        matches = [(-score, mod) for score, name, mod in matches_heap]
+        matches = [(-score, mod) for score, name, idx, mod in matches_heap]
         matches.sort(key=lambda x: x[0], reverse=True)
         
         for score, mod in matches:
@@ -2595,6 +2598,62 @@ class LibraryTab(QWidget):
         scroll_content_layout.setContentsMargins(0, 0, 0, 0)
         scroll_content_layout.setSpacing(20)
         
+        # Buttons for mod sharing
+        buttons_container = QWidget()
+        buttons_layout = QHBoxLayout(buttons_container)
+        buttons_layout.setContentsMargins(20, 0, 20, 0)
+        buttons_layout.setSpacing(15)
+        
+        # Generate Code button (Orange)
+        self.generate_code_button = QPushButton("Generate Code")
+        self.generate_code_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.generate_code_button.setStyleSheet("""
+            QPushButton {
+                background-color: #F7B10C;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #FF8C00;
+            }
+            QPushButton:pressed {
+                background-color: #FFC000;
+            }
+        """)
+        self.generate_code_button.clicked.connect(self.generate_share_code)
+        buttons_layout.addWidget(self.generate_code_button, 1)
+        
+        # Import Code button (White)
+        self.import_code_button = QPushButton("Import Code")
+        self.import_code_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.import_code_button.setStyleSheet("""
+            QPushButton {
+                background-color: white;
+                color: #F7B10C;
+                border: 1px solid #F7B10C;
+                padding: 10px 20px;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #FFF8E1;
+                border-color: #FF8C00;
+                color: #FF8C00;
+            }
+            QPushButton:pressed {
+                background-color: #FFE082;
+            }
+        """)
+        self.import_code_button.clicked.connect(self.import_share_code)
+        buttons_layout.addWidget(self.import_code_button, 1)
+        
+        scroll_content_layout.addWidget(buttons_container)
+        
         # "My mods" section header
         self.enabled_header_label = QLabel("My mods")
         self.enabled_header_label.setStyleSheet("""
@@ -2844,6 +2903,15 @@ class LibraryTab(QWidget):
         disabled_mods = []
         
         for mod_name, mod_data in installed_mods.items():
+            # Filter out LIB/repolib/bepinex mods (they shouldn't be shown in library)
+            mod_name_lower = mod_name.lower()
+            # Check for specific dependency/library mods (more precise matching)
+            if ("repolib" in mod_name_lower or 
+                "bepinex" in mod_name_lower or
+                mod_name_lower.endswith("-lib") or
+                mod_name_lower == "lib"):
+                continue
+            
             if self.is_mod_disabled(mod_name):
                 disabled_mods.append((mod_name, mod_data))
             else:
@@ -3036,11 +3104,288 @@ class LibraryTab(QWidget):
             elif self.disabled_mod_cards_layout.indexOf(card) >= 0:
                 self.disabled_mod_cards_layout.removeWidget(card)
             card.deleteLater()
+    
+    def generate_share_code(self):
+        """Generate a shareable code representing all installed mods"""
+        installed_mods = self.config.get_installed_mods()
+        
+        if not installed_mods:
+            QMessageBox.information(
+                self,
+                "No Mods",
+                "You don't have any mods installed to generate a code for.",
+                QMessageBox.StandardButton.Ok
+            )
+            return
+        
+        # Extract mod names (keys are the mod names)
+        mod_names = list(installed_mods.keys())
+        
+        # Create JSON structure
+        code_data = {"mods": mod_names}
+        json_string = json.dumps(code_data)
+        
+        # Encode as base64
+        code_bytes = json_string.encode('utf-8')
+        base64_code = base64.b64encode(code_bytes).decode('utf-8')
+        
+        # Copy to clipboard
+        clipboard = QApplication.clipboard()
+        clipboard.setText(base64_code)
+        
+        # Show success message
+        QMessageBox.information(
+            self,
+            "Code Generated",
+            f"Shareable code generated and copied to clipboard!\n\nMods included: {len(mod_names)}",
+            QMessageBox.StandardButton.Ok
+        )
+    
+    def import_share_code(self):
+        """Show dialog to import a shareable code"""
+        text, ok = QInputDialog.getText(
+            self,
+            "Import Mod Code",
+            "Paste the shareable code:",
+            QLineEdit.EchoMode.Normal
+        )
+        
+        if not ok or not text.strip():
+            return
+        
+        # Decode and validate the code
+        try:
+            mod_names = self._decode_and_validate_code(text.strip())
+            if not mod_names:
+                return
+            
+            # Show preview and confirmation
+            mod_list = "\n".join([f"  • {name}" for name in mod_names])
+            reply = QMessageBox.question(
+                self,
+                "Confirm Import",
+                f"The following {len(mod_names)} mod(s) will be installed:\n\n{mod_list}\n\nDependencies will be installed automatically.\n\nDo you want to continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                self.import_mods_from_code(mod_names)
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Invalid Code",
+                f"Failed to decode the code: {str(e)}\n\nPlease make sure you pasted the code correctly.",
+                QMessageBox.StandardButton.Ok
+            )
+    
+    def _decode_and_validate_code(self, code):
+        """Decode and validate a base64 code, returning list of mod names"""
+        try:
+            # Decode base64
+            decoded_bytes = base64.b64decode(code)
+            decoded_string = decoded_bytes.decode('utf-8')
+            
+            # Parse JSON
+            code_data = json.loads(decoded_string)
+            
+            # Validate structure
+            if not isinstance(code_data, dict):
+                raise ValueError("Code is not a valid JSON object")
+            
+            if "mods" not in code_data:
+                raise ValueError("Code does not contain 'mods' field")
+            
+            mod_names = code_data["mods"]
+            if not isinstance(mod_names, list):
+                raise ValueError("'mods' field must be a list")
+            
+            if not mod_names:
+                QMessageBox.information(
+                    self,
+                    "Empty Code",
+                    "The code does not contain any mods.",
+                    QMessageBox.StandardButton.Ok
+                )
+                return None
+            
+            return mod_names
+            
+        except json.JSONDecodeError as e:
+            raise ValueError("Invalid JSON format") from e
+        except Exception as e:
+            # Check if it's a base64 decoding error
+            if "Incorrect padding" in str(e) or "invalid" in str(e).lower() or "base64" in str(e).lower():
+                raise ValueError("Invalid base64 encoding") from e
+            raise
+    
+    def import_mods_from_code(self, mod_names):
+        """Install mods from a list of mod names"""
+        if not self.repo_path:
+            QMessageBox.warning(
+                self,
+                "No Game Path",
+                "Please set your R.E.P.O. game path first.",
+                QMessageBox.StandardButton.Ok
+            )
+            return
+        
+        # Check which mods are already installed
+        installed_mods = self.config.get_installed_mods()
+        mods_to_install = [name for name in mod_names if name not in installed_mods]
+        mods_already_installed = [name for name in mod_names if name in installed_mods]
+        
+        if not mods_to_install:
+            QMessageBox.information(
+                self,
+                "All Mods Installed",
+                "All mods from the code are already installed.",
+                QMessageBox.StandardButton.Ok
+            )
+            return
+        
+        if mods_already_installed:
+            skip_msg = f"\n\nSkipping {len(mods_already_installed)} already installed mod(s)."
+        else:
+            skip_msg = ""
+        
+        # Create progress dialog
+        progress = QProgressDialog("Installing mods...", "Cancel", 0, len(mods_to_install), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setWindowTitle("Importing Mods")
+        
+        failed_mods = []
+        success_count = 0
+        
+        try:
+            # Fetch package list once to enable searching by name
+            package_list_url = "https://thunderstore.io/c/repo/api/v1/package/"
+            package_list_response = get_requests_session().get(package_list_url)
+            package_list = []
+            if package_list_response.status_code == 200:
+                package_list = package_list_response.json()
+            
+            for i, mod_name in enumerate(mods_to_install):
+                if progress.wasCanceled():
+                    break
+                
+                progress.setLabelText(f"Installing {mod_name}... ({i+1}/{len(mods_to_install)})")
+                progress.setValue(i)
+                QApplication.processEvents()
+                
+                try:
+                    # First, try to find the mod in the package list (most reliable)
+                    mod_data_from_api = None
+                    mod_name_lower = mod_name.lower()
+                    
+                    # Search for mod in package list by matching the name (case-insensitive)
+                    # Mod names in Thunderstore are "author-modname" format
+                    for pkg in package_list:
+                        pkg_name_lower = pkg.get("name", "").lower()
+                        # Check if mod_name matches the end of the package name (after the last dash)
+                        # or matches exactly
+                        if pkg_name_lower.endswith(f"-{mod_name_lower}") or pkg_name_lower == mod_name_lower:
+                            mod_data_from_api = pkg
+                            break
+                    
+                    # If not found in package list, try direct API lookup
+                    if not mod_data_from_api:
+                        mod_url = f"https://thunderstore.io/c/repo/api/v1/package/{mod_name}/"
+                        mod_response = get_requests_session().get(mod_url)
+                        if mod_response.status_code == 200:
+                            mod_data_from_api = mod_response.json()
+                    
+                    if not mod_data_from_api:
+                        failed_mods.append((mod_name, "Mod not found on Thunderstore"))
+                        continue
+                    
+                    # Get latest version
+                    if not mod_data_from_api.get("versions"):
+                        failed_mods.append((mod_name, "Mod has no versions available"))
+                        continue
+                    
+                    latest_version = max(mod_data_from_api["versions"], key=lambda v: v["version_number"])
+                    
+                    # Prepare mod data for installation
+                    # Use the full package name from API (might be different from mod_name if we found it via search)
+                    full_mod_name = mod_data_from_api.get("name", mod_name)
+                    mod_data = {
+                        "name": full_mod_name,
+                        "version": latest_version["version_number"],
+                        "download_url": latest_version["download_url"],
+                        "icon": latest_version.get("icon", ""),
+                        "description": latest_version.get("description", ""),
+                        "dependencies": latest_version.get("dependencies", []),
+                        "downloads": latest_version.get("downloads", 0),
+                        "file_size": latest_version.get("file_size", 0),
+                        "creator": mod_data_from_api.get("owner", "Unknown")
+                    }
+                    
+                    # Create a temporary ModDetailsContent instance for installation
+                    # We need repo_path, so we'll use self.repo_path
+                    temp_widget = ModDetailsContent(
+                        mod_data=mod_data,
+                        repo_path=self.repo_path,
+                        parent=self,
+                        is_library=True
+                    )
+                    
+                    # Install dependencies first (without prompting user)
+                    if mod_data["dependencies"]:
+                        # Filter out already installed dependencies
+                        config = ConfigManager()
+                        deps_to_install = [
+                            dep for dep in mod_data["dependencies"]
+                            if not config.is_dependency_installed(dep)
+                        ]
+                        if deps_to_install:
+                            # Install dependencies silently (suppress individual success messages during batch import)
+                            temp_widget.install_dependencies(deps_to_install, show_success_message=False)
+                    
+                    # Install the main mod (suppress individual success messages during batch import)
+                    temp_widget.install_mod(mod_data, show_success_message=False)
+                    
+                    success_count += 1
+                    
+                except Exception as e:
+                    failed_mods.append((mod_name, str(e)))
+                
+                progress.setValue(i + 1)
+                QApplication.processEvents()
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Import Error",
+                f"Failed to import mods: {str(e)}",
+                QMessageBox.StandardButton.Ok
+            )
+        finally:
+            progress.close()
+            
+            # Refresh the library tab
+            self.load_installed_mods()
+            
+            # Show results
+            if failed_mods:
+                failed_list = "\n".join([f"  • {name}: {error}" for name, error in failed_mods])
+                QMessageBox.warning(
+                    self,
+                    "Import Complete",
+                    f"Successfully installed {success_count} mod(s).\n\nFailed to install {len(failed_mods)} mod(s):\n\n{failed_list}",
+                    QMessageBox.StandardButton.Ok
+                )
+            elif success_count > 0:
+                QMessageBox.information(
+                    self,
+                    "Import Complete",
+                    f"Successfully installed {success_count} mod(s)!{skip_msg}",
+                    QMessageBox.StandardButton.Ok
+                )
 
 class RepoHub(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("R.E.P.O. HUB v1.2.0")
+        self.setWindowTitle("R.E.P.O. HUB v1.2.2")
         self.setMinimumSize(1200, 800)
         self.drag_position = None  # Initialize drag_position for window dragging
         
@@ -3150,7 +3495,7 @@ class RepoHub(QMainWindow):
         title_layout.setSpacing(0)
 
         # Title label
-        title_label = QLabel("R.E.P.O. HUB v1.2.0")
+        title_label = QLabel("R.E.P.O. HUB v1.2.2")
         title_label.setObjectName("titleLabel")
         title_layout.addWidget(title_label)
 
